@@ -24,6 +24,8 @@ def fake_send(self, text, keyboard=None, preview=False):  # noqa: ANN001
 
 
 Bot.send = fake_send  # type: ignore[method-assign]
+# Binding is verified in memory; never let a synthetic chat id reach secrets/chat_id.txt.
+Config.save_chat_id = lambda self, chat_id: setattr(self, "chat_id", str(chat_id))  # type: ignore[method-assign]
 Bot.answer_callback = lambda self, *a, **k: None  # type: ignore[method-assign]
 
 CHAT = {"id": 999001, "type": "private"}
@@ -87,6 +89,46 @@ def main() -> int:
 
     # Restore the draft so the real flow can still use it.
     app.store.set_draft_status(40802006, "pending")
+
+    # --- /ai: the endpoint must be editable from the chat and survive a restart
+    SENT.clear()
+    app.handle(update_text("/ai"))
+    ok &= check("/ai shows settings", "تنظیمات AI" in SENT[0][0] and "Base URL" in SENT[0][0])
+
+    SENT.clear()
+    app.handle(update_text("/ai model some-test-model-1"))
+    ok &= check("/ai model persists",
+                app.ai.model == "some-test-model-1" and app.store.get_meta("ai_settings")["model"] == "some-test-model-1")
+
+    SENT.clear()
+    app.handle(update_text("/ai base https://example.invalid/v1/"))
+    ok &= check("/ai base trims trailing slash and saves",
+                app.ai.base_url == "https://example.invalid/v1")
+
+    SENT.clear()
+    app.handle(update_text("/ai temp 0.9"))
+    ok &= check("/ai temp accepts a float", app.ai.temperature == 0.9)
+
+    SENT.clear()
+    app.handle(update_text("/ai temp not-a-number"))
+    ok &= check("/ai rejects a bad number", "نامعتبر" in SENT[0][0] and app.ai.temperature == 0.9)
+
+    SENT.clear()
+    app.handle(update_text("/ai nonsense 1"))
+    ok &= check("/ai rejects an unknown field", "فیلد ناشناخته" in SENT[0][0])
+
+    # A reload from the store must see the same values: this is what a restart does.
+    from freelancer_manager.aisettings import AISettings
+    reloaded = AISettings.load(app.store)
+    ok &= check("settings survive a restart",
+                reloaded.model == "some-test-model-1" and reloaded.base_url == "https://example.invalid/v1")
+
+    SENT.clear()
+    app.handle(update_text("/ai reset"))
+    ok &= check("/ai reset restores defaults", "پیش‌فرض" in SENT[0][0])
+    app.ai = AISettings.load(app.store)
+    ok &= check("reset really cleared the model",
+                app.ai.model == "glm-5.3-flash" and app.ai.base_url == "https://ai.metft.ir/v1")
 
     print("\nALL PASS" if ok else "\nSOME CHECKS FAILED")
     return 0 if ok else 1

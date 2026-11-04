@@ -10,9 +10,11 @@ import logging
 import re
 import threading
 import time
+from pathlib import Path
 
 from .api import Client, FreelancerError
-from .config import Config
+from .config import SECRETS, Config
+from .aisettings import AISettings, ping as ai_ping
 from .proposal import DraftError, draft_proposal
 from .scan import TERMS, Filters, normalize, rank, reject_reason
 from .store import Store
@@ -29,6 +31,7 @@ class App:
         self.bot = Bot(cfg)
         self.api = Client(cfg)
         self.store = Store(cfg.db_path)
+        self.ai = AISettings.load(self.store)
         self.filters = Filters(cfg.budget_min, cfg.budget_max, cfg.max_bids)
 
     # ------------------------------------------------------------- scanning
@@ -108,6 +111,7 @@ class App:
                 skills,
                 amount,
                 period,
+                self.ai,
             )
         except (DraftError, Exception) as exc:  # noqa: BLE001
             log.exception("draft failed")
@@ -154,6 +158,83 @@ class App:
             f"https://www.freelancer.com/projects/{pid}/"
         )
 
+    # ----------------------------------------------------------------- ai
+    def cmd_ai(self, text: str) -> None:
+        """`/ai` — show or edit the model endpoint. Lives in the chat, not in files."""
+        # `key` and `token` are what the chat naturally types; `api_key` leaks the field name.
+        aliases = {"key": "api_key", "token": "api_key", "apikey": "api_key"}
+        parts = text.split(maxsplit=2)
+        if len(parts) > 1:
+            parts[1] = aliases.get(parts[1].lower(), parts[1])
+        sub = parts[1].lower() if len(parts) > 1 else ""
+
+        if sub in ("", "show"):
+            self.bot.send(
+                self.ai.summary() + "\n\n"
+                "تغییر:\n"
+                "<code>/ai base https://api.example.com/v1</code>\n"
+                "<code>/ai key sk-...</code>\n"
+                "<code>/ai model gpt-4o-mini</code>\n"
+                "<code>/ai temp 0.3</code>\n"
+                "<code>/ai maxtokens 900</code>\n"
+                "<code>/ai timeout 180</code>\n"
+                "<code>/ai test</code> — یک پیام واقعی به مدل\n"
+                "<code>/ai reset</code> — بازگشت به پیش‌فرض"
+            )
+            return
+
+        if sub == "test":
+            try:
+                reply = ai_ping(self.ai)
+                self.bot.send(f"✅ اتصال سالم است. پاسخ مدل: <code>{esc(reply[:40])}</code>")
+            except Exception as exc:  # noqa: BLE001
+                self.bot.send(f"❌ اتصال شکست خورد: <code>{esc(exc)}</code>")
+            return
+
+        if sub == "reset":
+            self.ai = AISettings.load()
+            self.ai.save(self.store)
+            self.bot.send("↩️ تنظیمات AI به پیش‌فرض برگشت.\n" + self.ai.summary())
+            return
+
+        value = parts[2].strip() if len(parts) > 2 else ""
+        if not value:
+            self.bot.send("مقدار را بفرست. مثال: <code>/ai model gpt-4o-mini</code>")
+            return
+
+        field_map = {
+            "base": "base_url", "url": "base_url", "base_url": "base_url",
+            "key": "api_key", "token": "api_key", "api_key": "api_key",
+            "model": "model",
+            "temp": "temperature", "temperature": "temperature",
+            "maxtokens": "max_tokens", "max_tokens": "max_tokens",
+            "timeout": "timeout",
+        }
+        field = field_map.get(sub)
+        if not field:
+            self.bot.send("فیلد ناشناخته. یکی از: base, key, model, temp, maxtokens, timeout")
+            return
+
+        try:
+            if field in ("temperature",):
+                setattr(self.ai, field, float(value))
+            elif field in ("max_tokens", "timeout"):
+                setattr(self.ai, field, int(value))
+            else:
+                setattr(self.ai, field, value.rstrip("/"))
+        except ValueError:
+            self.bot.send(f"مقدار نامعتبر برای {sub}: <code>{esc(value)}</code>")
+            return
+
+        self.ai.save(self.store)
+        # A key written from the chat also goes to secrets/ so a plain restart keeps it.
+        if field == "api_key":
+            p = Path(SECRETS / "ai_key.txt")
+            p.write_text(self.ai.api_key, encoding="utf-8")
+            p.chmod(0o600)
+
+        self.bot.send("✅ ذخیره شد.\n" + self.ai.summary() + "\n\nبرای تست: <code>/ai test</code>")
+
     # ------------------------------------------------------------ dispatch
     def handle(self, update: dict) -> None:
         if "callback_query" in update:
@@ -189,6 +270,7 @@ class App:
                 "/scan — اسکن projekt‌های جدید\n"
                 "/drafts — پیش‌نویس‌های منتظر تأیید\n"
                 "/bids — bid‌های ثبت‌شده\n"
+                "/ai — تنظیم API، کلید و مدل\n"
                 "یا فقط آیدی پروژه را بنویس تا پیشنهاد بنویسم."
             )
         elif low.startswith("/scan"):
@@ -205,6 +287,8 @@ class App:
                     f"{esc(r['description'][:600])}",
                     keyboard=kb,
                 )
+        elif low.startswith("/ai"):
+            self.cmd_ai(text)
         elif low.startswith("/bids"):
             bids, _ = self.api.my_bids()
             if not bids:

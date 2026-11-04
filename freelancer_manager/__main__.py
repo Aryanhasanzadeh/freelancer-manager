@@ -4,17 +4,22 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 
 from .config import Config
+
+
+def _env(name: str, default: str = "") -> str:
+    return os.environ.get(name, default).strip()
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(prog="freelancer-manager")
     ap.add_argument("cmd", nargs="?", default="run",
                     choices=["run", "scan", "bids", "whoami"])
-    ap.add_argument("--interval", type=int, default=0,
-                    help="minutes between background scans (0 = manual /scan only)")
+    ap.add_argument("--interval", type=int, default=None,
+                    help="minutes between background scans (default FL_INTERVAL, 0 = manual only)")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -49,9 +54,11 @@ def main() -> int:
             print(b["id"], b["project_id"], b["amount"], b["period"])
         return 0
 
-    if args.interval:
+    # --interval wins, then FL_INTERVAL from .env, then no background scanning.
+    interval = args.interval if args.interval is not None else int(_env("FL_INTERVAL", "30") or 0)
+    if interval:
         from .bot import start_scout_thread
-        start_scout_thread(app, args.interval)
+        start_scout_thread(app, interval)
     app.run()
     return 0
 

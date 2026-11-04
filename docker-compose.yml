@@ -1,0 +1,29 @@
+# Standalone deployment: no host python, no venv, one state volume.
+#
+#   cp .env.example .env && $EDITOR .env
+#   docker compose up -d --build
+#   docker compose logs -f
+#
+# State lives in ./data (SQLite + seen list) and ./secrets (tokens, cookies),
+# so the container itself is disposable.
+services:
+  bot:
+    build: .
+    image: freelancer-manager:latest
+    container_name: freelancer-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      PYTHONUNBUFFERED: "1"
+      FL_DB: /app/data/fl.db
+      FL_SEEN: /app/data/seen.json
+      FL_COOKIES: /app/secrets/cookies.txt
+    volumes:
+      - ./data:/app/data
+      - ./secrets:/app/secrets:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
