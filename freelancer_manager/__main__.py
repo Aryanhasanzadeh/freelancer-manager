@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 
+from . import logbuf
 from .config import Config
 
 
@@ -27,6 +28,8 @@ def main() -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # /logs reads this ring, so a bot without journal access can still explain itself.
+    logbuf.install()
 
     cfg = Config()
     if not cfg.bot_token:

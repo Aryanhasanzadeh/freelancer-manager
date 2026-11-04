@@ -13,14 +13,28 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from freelancer_manager.bot import App  # noqa: E402
 from freelancer_manager.config import Config  # noqa: E402
+from freelancer_manager import menu as menus  # noqa: E402
+from freelancer_manager.runtime import Runtime  # noqa: E402
 from freelancer_manager.tg import Bot  # noqa: E402
 
 SENT: list[tuple[str, list | None]] = []
 
 
+MENUS: list[tuple[list[list[str]], str]] = []
+
+
 def fake_send(self, text, keyboard=None, preview=False):  # noqa: ANN001
     SENT.append((text, keyboard))
     return len(SENT)
+
+
+def fake_menu(self, rows, text="منو"):  # noqa: ANN001
+    MENUS.append((rows, text))
+    return 1
+
+
+Bot.menu = fake_menu  # type: ignore[method-assign]
+Bot.hide_menu = lambda self, text="": None  # type: ignore[method-assign]
 
 
 Bot.send = fake_send  # type: ignore[method-assign]
@@ -53,8 +67,14 @@ def main() -> int:
     ok = True
 
     SENT.clear()
+    MENUS.clear()
     app.handle(update_text("/start"))
-    ok &= check("/start replies", len(SENT) == 1 and "scan" in SENT[0][0])
+    ok &= check("/start opens the menu", len(MENUS) == 1 and len(MENUS[0][0]) == 4)
+    # Compare against the module's own labels: ZWNJ in Persian words makes literals brittle.
+    ok &= check("/start lists every section",
+                [b for row in MENUS[0][0] for b in row] == menus.LABELS)
+    ok &= check("every menu button maps to a command",
+                all(b in menus.LABEL_TO_CMD for b in menus.LABELS))
     ok &= check("/start binds chat id", app.cfg.chat_id == "999001")
 
     SENT.clear()
@@ -89,6 +109,66 @@ def main() -> int:
 
     # Restore the draft so the real flow can still use it.
     app.store.set_draft_status(40802006, "pending")
+
+    # --- menu: every button must route, not just render
+    MENUS.clear()
+    app.handle(update_text("/menu"))
+    ok &= check("/menu re-sends the keyboard", len(MENUS) == 1)
+
+    for label, needle in [
+        ("📊 وضعیت", "وضعیت ربات"),
+        ("⚙️ تنظیمات", "تنظیمات"),
+        ("📋 لاگ", "آخرین رویدادها"),
+    ]:
+        SENT.clear()
+        app.handle(update_text(label))
+        ok &= check(f"button {label} routes", bool(SENT) and needle in SENT[0][0])
+
+    SENT.clear()
+    app.handle(update_text("🧹 پاک‌سازی"))
+    ok &= check("cleanup asks before deleting",
+                bool(SENT) and any(b["callback_data"] == "confirmed:" for row in SENT[0][1] for b in row))
+
+    # --- settings: a button opens a prompt, the next message is the value
+    SENT.clear()
+    app.handle(update_text("⚙️ تنظیمات"))
+    buttons = {b["callback_data"]: b["text"] for row in SENT[0][1] for b in row}
+    ok &= check("settings lists every knob",
+                all(f"cfg:{k}" in buttons for k in
+                    ["budget_min", "budget_max", "max_bids", "shortlist", "interval", "period", "milestone", "scout"]))
+
+    SENT.clear()
+    app.handle(update_cb("cfg:interval"))
+    ok &= check("picking a knob asks for a value", app.awaiting == "interval")
+
+    SENT.clear()
+    app.handle(update_text("45"))
+    ok &= check("typed value is stored", app.rt["interval"] == 45)
+    ok &= check("prompt is cleared afterwards", app.awaiting is None)
+    ok &= check("value survives a reload", Runtime.load(app.store)["interval"] == 45)
+
+    SENT.clear()
+    app.handle(update_cb("cfg:budget_min"))
+    SENT.clear()
+    app.handle(update_text("not-a-number"))
+    ok &= check("bad setting is rejected, old value kept",
+                app.rt["budget_min"] == 10.0 and "نامعتبر" in SENT[0][0])
+
+    SENT.clear()
+    app.handle(update_text("/cancel"))
+    ok &= check("/cancel clears a pending prompt", app.awaiting is None)
+
+    # Restore defaults so the file on disk is unchanged by a test run.
+    app.rt.values["interval"] = 30
+    app.rt.save()
+
+    # --- /cleanup confirm path
+    before = len(app.store.seen_ids())
+    app.store.mark_seen(99900001, "test")
+    SENT.clear()
+    app.handle(update_cb("confirmed:"))
+    ok &= check("confirmed cleanup clears seen ids", len(app.store.seen_ids()) == 0)
+    app.store.mark_seen(99900001, "restored") if before else None
 
     # --- /ai: the endpoint must be editable from the chat and survive a restart
     SENT.clear()

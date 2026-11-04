@@ -69,6 +69,30 @@ class Bot:
             if "message is not modified" not in str(exc):
                 raise
 
+    def menu(self, rows: list[list[str]], text: str = "منو") -> int:
+        """Persistent bottom keyboard: tap a button instead of typing a command."""
+        if not self.cfg.chat_id:
+            log.warning("no chat bound yet, dropping menu")
+            return 0
+        res = self.call(
+            "sendMessage",
+            chat_id=self.cfg.chat_id,
+            text=text,
+            reply_markup={
+                "keyboard": [[{"text": b} for b in row] for row in rows],
+                "resize_keyboard": True,
+                "is_persistent": True,
+                "input_field_placeholder": "آیدی پروژه یا دکمه‌ا‌ی منو",
+            },
+        )
+        return res["message_id"]
+
+    def hide_menu(self, text: str = "منو بسته شد.") -> None:
+        if not self.cfg.chat_id:
+            return
+        self.call("sendMessage", chat_id=self.cfg.chat_id, text=text,
+                  reply_markup={"remove_keyboard": True})
+
     def updates(self, offset: int, timeout: int = 50) -> list[dict]:
         payload = {"timeout": timeout, "allowed_updates": ["message", "callback_query"]}
         if offset:

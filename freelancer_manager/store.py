@@ -122,6 +122,21 @@ class Store:
         except (TypeError, ValueError):
             return row[0]
 
+    def stats(self) -> dict:
+        def count(sql: str) -> int:
+            row = self._one(sql)
+            return row[0] if row else 0
+        return {
+            "seen": count("SELECT COUNT(*) FROM seen"),
+            "pending": count("SELECT COUNT(*) FROM drafts WHERE status='pending'"),
+            "drafts": count("SELECT COUNT(*) FROM drafts"),
+            "bids": count("SELECT COUNT(*) FROM bids"),
+        }
+
+    def clear_seen(self) -> int:
+        """Forget every project id so a scan can rediscover the current pool."""
+        return self._write("DELETE FROM seen")
+
     def set_meta(self, k: str, v) -> None:
         self._write(
             "INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",

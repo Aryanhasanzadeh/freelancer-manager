@@ -14,7 +14,9 @@ from pathlib import Path
 
 from .api import Client, FreelancerError
 from .config import SECRETS, Config
+from . import logbuf, menu as menus
 from .aisettings import AISettings, ping as ai_ping
+from .runtime import Runtime
 from .proposal import DraftError, draft_proposal
 from .scan import TERMS, Filters, normalize, rank, reject_reason
 from .store import Store
@@ -32,7 +34,11 @@ class App:
         self.api = Client(cfg)
         self.store = Store(cfg.db_path)
         self.ai = AISettings.load(self.store)
+        self.rt = Runtime.load(self.store)
+        self.rt.apply(cfg)
         self.filters = Filters(cfg.budget_min, cfg.budget_max, cfg.max_bids)
+        # Set when a settings button asked for a value; the next message is that value.
+        self.awaiting: str | None = None
 
     # ------------------------------------------------------------- scanning
     def scan(self) -> tuple[list[dict], int]:
@@ -50,6 +56,9 @@ class App:
             for p in pool.values()
             if p["id"] not in seen and reject_reason(p, self.filters, now) is None
         ]
+        # Surfaced in /status so a silent scanner is distinguishable from a broken one.
+        self.store.set_meta("last_scan", int(now))
+        self.store.set_meta("last_scan_pool", len(pool))
         return rank(found), len(pool)
 
     def format_project(self, p: dict) -> str:
@@ -158,6 +167,51 @@ class App:
             f"https://www.freelancer.com/projects/{pid}/"
         )
 
+    # ---------------------------------------------------------------- menu
+    def cmd_menu(self, first: bool = False) -> None:
+        intro = (
+            "🤖 <b>ربات فریلنسر — پنل مدیریت</b>\n\n"
+            "از دکمه‌های پایین هر بخش را باز کن. دستورهای متنی هم کار می‌کنند:\n"
+            "/scan /drafts /bids /status /settings /ai /session /logs /cleanup"
+        ) if first else "منو در پایین صفحه فعال شد."
+        self.bot.menu(menus.MENU_ROWS, text=intro)
+
+    def cmd_status(self) -> None:
+        self.bot.send(menus.status_text(self))
+
+    def cmd_settings(self) -> None:
+        self.bot.send(menus.settings_text(self.rt), keyboard=menus.settings_keyboard())
+
+    def cmd_logs(self) -> None:
+        lines = logbuf.tail(14) or ["(هنوز چیزی ثبت نشده)"]
+        body = "\n".join(esc(line) for line in lines)
+        self.bot.send(f"📋 <b>آخرین رویدادها</b>\n<pre>{body}</pre>")
+
+    def cmd_session(self) -> None:
+        """Cookies expire silently; prove the session by comparing the API's user."""
+        try:
+            user = self.api.verify_session()
+            self.bot.send(f"🔑 سشن سالم است. کاربر: <code>{esc(user)}</code>")
+        except (FreelancerError, Exception) as exc:  # noqa: BLE001
+            self.bot.send(
+                "❌ سشن فریلنسر کار نمی‌کند.\n"
+                f"<code>{esc(exc)}</code>\n\n"
+                f"فایل <code>secrets/cookies.txt</code> را از مرورگر تازه کن و ربات را ری‌استارت کن."
+            )
+
+    def cmd_cleanup(self, confirm: bool = False) -> None:
+        if not confirm:
+            self.bot.send(
+                "🧹 <b>پاک‌سازی</b>\n"
+                "لیست «دیده‌شده» خالی می‌شود تا اسکن بعدی دوباره پروژه‌های فعلی را پیدا کند.\n"
+                "پیش‌نویس‌ها و bid‌ها دست نمی‌خورند.",
+                keyboard=[[{"text": "✅ بله، خالی کن", "callback_data": "confirmed:"}],
+                          [{"text": "انصراف", "callback_data": "cancel:"}]],
+            )
+            return
+        removed = self.store.clear_seen()
+        self.bot.send(f"✅ {removed} پروژه از لیست دیده‌شده پاک شد. اسکن بعدی دوباره پر می‌کند.")
+
     # ----------------------------------------------------------------- ai
     def cmd_ai(self, text: str) -> None:
         """`/ai` — show or edit the model endpoint. Lives in the chat, not in files."""
@@ -251,6 +305,19 @@ class App:
                 self.bot.send(f"پیش‌نویس {arg} کنار گذاشته شد.")
             elif action == "price":
                 self.bot.send(f"قیمت جدید را بفرست: <code>price {arg} 250 5</code>")
+            elif action == "cfg":
+                label = menus.SPEC[arg][3]
+                self.awaiting = arg
+                self.bot.send(
+                    f"مقدار تازه برای <b>{esc(label)}</b> را بفرست.\n"
+                    f"مقدار فعلی: <code>{self.rt[arg]}</code>\n"
+                    "/cancel برای انصراف"
+                )
+            elif action == "confirmed":
+                self.cmd_cleanup(confirm=True)
+            elif action == "cancel":
+                self.awaiting = None
+                self.bot.send("لغو شد.")
             return
 
         msg = update.get("message") or {}
@@ -262,17 +329,32 @@ class App:
         if chat_id and chat_id != self.cfg.chat_id:
             self.cfg.save_chat_id(chat_id)
             log.info("bound to chat %s", chat_id)
+
+        # A menu button just sends its label; translate it to the real command.
+        text = menus.LABEL_TO_CMD.get(text, text)
         low = text.lower()
 
+        if low in ("/cancel", "cancel"):
+            self.awaiting = None
+            self.bot.send("لغو شد.")
+            return
+
+        # A pending settings prompt owns the next plain message.
+        if self.awaiting and not low.startswith("/"):
+            key = self.awaiting
+            self.awaiting = None
+            try:
+                value = self.rt.set(key, text)
+            except (ValueError, KeyError):
+                self.bot.send("مقدار نامعتبر. دوباره از ⚙️ تنظیمات امتحان کن.")
+                return
+            self.rt.apply(self.cfg)
+            self.filters = Filters(self.cfg.budget_min, self.cfg.budget_max, self.cfg.max_bids)
+            self.bot.send(f"✅ {esc(menus.SPEC[key][3])} شد <b>{esc(value)}</b>")
+            return
+
         if low.startswith("/start"):
-            self.bot.send(
-                "ربات پروژه‌یاب آماده است.\n"
-                "/scan — اسکن projekt‌های جدید\n"
-                "/drafts — پیش‌نویس‌های منتظر تأیید\n"
-                "/bids — bid‌های ثبت‌شده\n"
-                "/ai — تنظیم API، کلید و مدل\n"
-                "یا فقط آیدی پروژه را بنویس تا پیشنهاد بنویسم."
-            )
+            self.cmd_menu(first=True)
         elif low.startswith("/scan"):
             self.cmd_scan()
         elif low.startswith("/drafts"):
@@ -287,6 +369,18 @@ class App:
                     f"{esc(r['description'][:600])}",
                     keyboard=kb,
                 )
+        elif low.startswith("/menu"):
+            self.cmd_menu()
+        elif low.startswith("/status"):
+            self.cmd_status()
+        elif low.startswith("/settings"):
+            self.cmd_settings()
+        elif low.startswith("/logs"):
+            self.cmd_logs()
+        elif low.startswith("/session"):
+            self.cmd_session()
+        elif low.startswith("/cleanup"):
+            self.cmd_cleanup()
         elif low.startswith("/ai"):
             self.cmd_ai(text)
         elif low.startswith("/bids"):
@@ -319,10 +413,32 @@ class App:
         elif ID_RE.search(text):
             self.make_draft(int(ID_RE.search(text).group(1)))
 
+    # ------------------------------------------------------------- commands
+    def register_commands(self) -> None:
+        """Populate the Telegram command list so / is discoverable without the menu."""
+        cmds = [
+            ("menu", "پنل مدیریت و دکمه‌ها"),
+            ("scan", "اسکن پروژه‌های جدید"),
+            ("drafts", "پیش‌نویس‌های منتظر تأیید"),
+            ("bids", "bid‌های ثبت‌شده"),
+            ("status", "وضعیت و آمار"),
+            ("settings", "تنظیم بودجه، فاصلهٔ اسکن و ..."),
+            ("ai", "API، کلید و مدل"),
+            ("session", "تست سشن فریلنسر"),
+            ("logs", "آخرین رویدادها"),
+            ("cleanup", "خالی کردن لیست دیده‌شده"),
+        ]
+        try:
+            self.bot.call("setMyCommands",
+                          commands=[{"command": c, "description": d} for c, d in cmds])
+        except Exception:  # noqa: BLE001 - cosmetic, never blocks startup
+            log.warning("setMyCommands failed", exc_info=True)
+
     # ----------------------------------------------------------------- loop
     def run(self) -> None:
         me = self.bot.call("getMe")
         log.info("bot @%s up", me.get("username"))
+        self.register_commands()
         offset = int(self.store.get_meta("offset", 0) or 0)
         while True:
             try:
@@ -343,8 +459,13 @@ def start_scout_thread(app: App, interval_min: int) -> None:
 
     def loop() -> None:
         while True:
+            if not app.rt["scout"]:
+                # Toggled off from /settings; sleep in small steps so it reactivates fast.
+                time.sleep(30)
+                continue
             try:
                 items, _ = app.scan()
+                app.store.set_meta("last_scan_found", len(items))
                 if items:
                     top = items[: app.cfg.shortlist]
                     app.bot.send(f"🔎 <b>{len(items)}</b> پروژهٔ جدید پیدا شد.")
@@ -357,7 +478,7 @@ def start_scout_thread(app: App, interval_min: int) -> None:
                     log.info("scout: nothing eligible")
             except Exception:  # noqa: BLE001
                 log.exception("scout cycle failed")
-            time.sleep(interval_min * 60)
+            time.sleep((app.rt["interval"] or interval_min) * 60)
 
     t = threading.Thread(target=loop, name="scout", daemon=True)
     t.start()
