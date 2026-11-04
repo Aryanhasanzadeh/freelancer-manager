@@ -69,6 +69,7 @@ Bot.hide_menu = lambda self, text="": None  # type: ignore[method-assign]
 Bot.send = fake_send  # type: ignore[method-assign]
 Bot.answer_callback = lambda self, *a, **k: None  # type: ignore[method-assign]
 # Binding is checked in memory; never let a synthetic chat id touch secrets/chat_id.txt.
+_real_save_chat_id = Config.save_chat_id
 Config.save_chat_id = lambda self, chat_id: setattr(self, "chat_id", str(chat_id))  # type: ignore[method-assign]
 
 
@@ -428,8 +429,89 @@ def main() -> int:
     ok &= check("every draft row belongs to a real user",
                 all(app.db.user(r["tenant"]) is not None for r in rows))
 
+    # ------------------------------------------------------------- deployment
+    ok &= deploy_contract(cfg, app, t)
+
     print("\nALL PASS" if ok else "\nSOME CHECKS FAILED")
     return 0 if ok else 1
+
+
+def deploy_contract(cfg, app, t) -> bool:
+    """The bot has to come up in a container, so the container's assumptions are tested.
+
+    These are the traps that only bite on a rebuilt image: an owner binding that
+    lives in the image instead of .env, a heartbeat that never advances, a compose
+    file that starts two pollers, or a Dockerfile that runs as root and therefore
+    cannot write the mounted state.
+    """
+    import json
+    import os
+    import time as clock
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    ok = True
+
+    # 1. A bound owner must survive a container rebuild: FL_CHAT_ID wins over the
+    #    baked secrets/chat_id.txt, and adopting a chat must not rewrite that file —
+    #    in a container it sits inside the image and the write would be lost.
+    old_env = os.environ.get("FL_CHAT_ID")
+    try:
+        os.environ["FL_CHAT_ID"] = "424242"
+        pinned = Config()
+        ok &= check("FL_CHAT_ID is read from the environment",
+                    pinned.chat_id == "424242" and pinned.chat_id_from_env)
+        # A pin must not be overwritten by the first chat that talks.
+        _real_save_chat_id(pinned, "999999")
+        ok &= check("save_chat_id does not change a pinned owner",
+                    pinned.chat_id == "424242")
+    finally:
+        if old_env is None:
+            os.environ.pop("FL_CHAT_ID", None)
+        else:
+            os.environ["FL_CHAT_ID"] = old_env
+
+    # 2. Heartbeat: the probe is what Docker uses, so it must pass for a live loop
+    #    and fail for a stale one instead of always reporting healthy.
+    import importlib
+    __main__ = importlib.import_module("freelancer_manager.__main__")
+    beat = cfg.health_path
+    beat.write_text(str(int(clock.time())), encoding="utf-8")
+    ok &= check("health passes on a fresh heartbeat", __main__.health(cfg) == 0)
+    beat.write_text(str(int(clock.time()) - 3600), encoding="utf-8")
+    ok &= check("health fails on a stale heartbeat", __main__.health(cfg) == 1)
+    beat.unlink()
+    ok &= check("health fails with no heartbeat at all", __main__.health(cfg) == 1)
+
+    # The long-poll must return well inside the probe window, otherwise a quiet bot
+    # goes stale-and-unhealthy and gets restarted for doing nothing wrong.
+    import re
+    loop = (root / "freelancer_manager" / "bot.py").read_text(encoding="utf-8")
+    poll = re.search(r"self\.bot\.updates\(offset, timeout=(\d+)\)", loop)
+    ok &= check("poll loop uses a bounded long-poll timeout", poll is not None)
+    ok &= check("heartbeat window is twice the poll timeout",
+                poll is not None and __main__.HEALTH_MAX_AGE >= 2 * int(poll.group(1)))
+
+    # 3. Compose/Dockerfile: one poller, a probe, a non-root user, state mounted.
+    compose = (root / "docker-compose.yml").read_text(encoding="utf-8")
+    dockerfile = (root / "Dockerfile").read_text(encoding="utf-8")
+    ok &= check("compose runs exactly one bot service",
+                compose.count("container_name: freelancer-bot") == 1)
+    ok &= check("compose mounts state instead of baking it",
+                "./data:/app/data" in compose and "./secrets:/app/secrets:ro" in compose)
+    ok &= check("compose has no published ports (a poller needs none)",
+                "ports:" not in compose)
+    ok &= check("compose restarts after a crash", "restart: unless-stopped" in compose)
+    ok &= check("image declares a healthcheck", "HEALTHCHECK" in dockerfile)
+    ok &= check("healthcheck calls the same probe the suite exercises",
+                "freelancer_manager\", \"health\"" in dockerfile)
+    ok &= check("container does not run as root", "USER bot" in dockerfile)
+
+    # 4. A test run must never touch the deployed database: the sandbox is the proof.
+    ok &= check("suite writes only inside its sandbox",
+                str(app.cfg.db_path).startswith(tempfile.gettempdir()))
+
+    return ok
 
 
 if __name__ == "__main__":

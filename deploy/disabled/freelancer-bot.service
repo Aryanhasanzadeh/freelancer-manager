@@ -1,0 +1,18 @@
+[Unit]
+Description=Freelancer.com project bot (scan, draft, confirm, bid)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/freelancer-manager
+EnvironmentFile=-/opt/freelancer-manager/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/freelancer-manager/.venv/bin/python -m freelancer_manager run
+Restart=always
+RestartSec=10
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

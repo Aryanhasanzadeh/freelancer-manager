@@ -58,29 +58,54 @@ A fresh server therefore only needs the bot token; the rest can be set from `/ai
 
 ## Deploy on a new server
 
-Option A — systemd (venv, nothing global):
+Docker is the supported install. Nothing runs on the host: no venv, no systemd unit.
 
 ```bash
 git clone https://github.com/Aryanhasanzadeh/freelancer-manager.git
 cd freelancer-manager
-sudo bash deploy/install.sh          # venv + unit + enable + start
-$EDITOR .env                         # FL_BOT_TOKEN, FL_CHAT_ID (optional)
-$EDITOR secrets/cookies.txt          # Freelancer cookies
-sudo systemctl restart freelancer-bot
-```
-
-The installer is idempotent and refuses Python < 3.10. Then press Start on the bot in
-Telegram — the first chat to send `/start` is bound automatically.
-
-Option B — Docker:
-
-```bash
-cp .env.example .env && $EDITOR .env
+cp .env.example .env
+$EDITOR .env                    # FL_BOT_TOKEN required, FL_CHAT_ID recommended
+mkdir -p data secrets
+printf '%s' "$COOKIES" > secrets/cookies.txt   # Freelancer session cookies
 docker compose up -d --build
 docker compose logs -f
 ```
 
-State (`data/`, `secrets/`) is bind-mounted, so the container is disposable.
+`FL_CHAT_ID` pins the owner. Set it before the first start: the owner is a tenant
+row in `data/fl.db` and the fallback "first chat becomes owner" only applies when no
+id is pinned, so a recreated container keeps the same owner either way but a pinned
+id cannot be raced.
+
+State (`data/fl.db`, `secrets/`) is bind-mounted, so the container is disposable.
+`secrets/` is mounted read-only, so the process cannot rewrite its own token.
+
+**One poller only.** Two processes polling the same token steal updates from each
+other and each chat is answered by whichever wins. `docker compose up -d` always
+keeps a single `bot` service; if this host previously ran the systemd install, move
+it over with:
+
+```bash
+sudo bash deploy/dockerize.sh
+```
+
+That disables and stops `freelancer-bot.service`, hands `data/` and `secrets/` to the
+container user (uid 10001 / gid 999), then starts the stack and waits for the
+healthcheck. A rollback is `systemctl enable --now freelancer-bot` after
+`docker compose down`.
+
+### Health, logs, tests
+
+```bash
+docker compose ps                                  # health column comes from the probe
+docker compose exec bot python -m freelancer_manager health
+docker compose logs -f --tail 100
+docker compose --profile test run --rm tests       # the isolation suite, in the image
+```
+
+The container writes `data/.heartbeat` on every poll pass and a probe fails when it
+is older than 120s, so a wedged process is reported unhealthy instead of looking
+alive just because the container still exists. `restart: unless-stopped` turns that
+into a self-heal.
 
 ## Filters
 
@@ -122,16 +147,19 @@ freelancer_manager/
   menu.py        the pinned keyboard, label→command map, status/settings text
   logbuf.py      in-process log ring behind /logs
   proposal.py    LLM drafting
-  store.py       SQLite: seen, drafts, bids, meta
+  store.py       SQLite: tenant-scoped seen, drafts, bids, meta
+  tenant.py      one chat's account, cookies, AI settings and knobs
   bot.py         dispatcher, scanning, drafting, bidding
-  tg.py          Telegram transport
+  tg.py          Telegram transport, per-chat reply routing
 tests/
   dry_run.py       scan + draft with Telegram output captured in memory
-  dispatch_test.py synthetic updates through the real dispatcher
+  dispatch_test.py isolation suite: synthetic updates through the real dispatcher,
+                   then the deployment contract (owner pin, heartbeat, compose)
 deploy/
-  install.sh       fresh-server installer (venv + systemd unit)
+  dockerize.sh     move a host from the systemd install to the container one
+  install.sh       legacy venv + systemd installer (kept for rollback)
   freelancer-bot.service
-Dockerfile, docker-compose.yml   container deployment
+Dockerfile, docker-compose.yml   container deployment (the supported one)
 .env.example     every knob, documented
 ```
 

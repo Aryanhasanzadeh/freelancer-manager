@@ -1,29 +1,50 @@
-# Standalone deployment: no host python, no venv, one state volume.
+# Container deployment: no host python, no venv, no systemd unit.
 #
-#   cp .env.example .env && $EDITOR .env
+#   cp .env.example .env && $EDITOR .env      # FL_BOT_TOKEN and FL_CHAT_ID at least
 #   docker compose up -d --build
 #   docker compose logs -f
+#   docker compose exec bot python -m freelancer_manager health
 #
-# State lives in ./data (SQLite + seen list) and ./secrets (tokens, cookies),
-# so the container itself is disposable.
+# State lives in ./data (SQLite) and ./secrets (token, legacy cookie file); both are
+# mounted, so the container is disposable and `docker compose down -v` loses nothing.
 services:
   bot:
     build: .
     image: freelancer-manager:latest
     container_name: freelancer-bot
     restart: unless-stopped
+    # A single poller: two replicas would both call getUpdates and steal updates.
+    stop_grace_period: 20s
     env_file:
       - .env
     environment:
       PYTHONUNBUFFERED: "1"
       FL_DB: /app/data/fl.db
-      FL_SEEN: /app/data/seen.json
+      FL_HEALTH: /app/data/.heartbeat
       FL_COOKIES: /app/secrets/cookies.txt
     volumes:
       - ./data:/app/data
+      # :ro because a deployed bot only reads its secrets; the owner id is in .env.
       - ./secrets:/app/secrets:ro
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
+
+  # `docker compose run --rm tests` — the same isolation suite as CI, in the image.
+  tests:
+    build: .
+    image: freelancer-manager:latest
+    profiles: ["test"]
+    entrypoint: ["python", "tests/dispatch_test.py"]
+    env_file:
+      - .env
+    environment:
+      FL_DB: /tmp/fl-test/fl.db
+      FL_HEALTH: /tmp/fl-test/.heartbeat
+    volumes:
+      # The suite builds a Bot (which needs a token) but never calls the network.
+      - ./secrets:/app/secrets:ro
+    tmpfs:
+      - /tmp/fl-test

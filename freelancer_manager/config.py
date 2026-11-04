@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parent.parent
 SECRETS = ROOT / "secrets"
@@ -50,12 +53,15 @@ def _secret(name: str, env: str = "") -> str:
 class Config:
     def __init__(self) -> None:
         self.bot_token = _secret("bot_token.txt", "FL_BOT_TOKEN")
+        self.chat_id_from_env = bool(_cfg("FL_CHAT_ID"))
         self.chat_id = _cfg("FL_CHAT_ID") or _secret("chat_id.txt")
         self.user_id = _cfg("FL_USER_ID", "40891893")
         self.username = _cfg("FL_USERNAME", "aryanhz")
         self.cookies_path = Path(_cfg("FL_COOKIES", str(SECRETS / "cookies.txt")))
         self.db_path = Path(_cfg("FL_DB", str(DATA / "fl.db")))
         self.seen_path = Path(_cfg("FL_SEEN", str(DATA / "seen.json")))
+        # Written by the poll loop on every pass; the container healthcheck reads it.
+        self.health_path = Path(_cfg("FL_HEALTH", str(DATA / ".heartbeat")))
 
         # scan filters
         self.budget_min = float(_cfg("FL_BUDGET_MIN", "10"))
@@ -71,11 +77,22 @@ class Config:
         self.web = "https://www.freelancer.com"
 
     def save_chat_id(self, chat_id: str) -> None:
-        """Adopt the first chat that talks to the bot, so no id has to be guessed."""
+        """Adopt the first chat that talks to the bot, so no id has to be guessed.
+
+        Only binds the *file* copy when no explicit FL_CHAT_ID was given: in a container
+        that file is baked into the image, so writing it would lose the owner on every
+        restart and hand the bot to whoever writes first.
+        """
+        if self.chat_id_from_env:
+            # A pinned owner is the deployment's decision, not the first comer's.
+            return
         self.chat_id = str(chat_id)
         path = SECRETS / "chat_id.txt"
-        path.write_text(self.chat_id, encoding="utf-8")
-        path.chmod(0o600)
+        try:
+            path.write_text(self.chat_id, encoding="utf-8")
+            path.chmod(0o600)
+        except OSError as exc:  # a read-only secrets mount is a normal deployment
+            log.debug("could not persist chat id: %s", exc)
 
     def cookies(self) -> dict[str, str]:
         # A missing file is the normal logged-out state, not a crash: the bot has to

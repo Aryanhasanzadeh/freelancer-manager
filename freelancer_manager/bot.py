@@ -678,15 +678,26 @@ class App:
         log.info("bot @%s up — %d user(s)", me.get("username"), len(self.db.users()))
         self.register_commands()
         offset = int(self.db.tenant(GLOBAL).get_meta("offset", 0) or 0)
+        marker = self.cfg.health_path
         while True:
             try:
-                for update in self.bot.updates(offset):
+                # 15s long-poll: short enough that the heartbeat below refreshes well
+                # inside the probe's 120s window even when nothing is arriving.
+                for update in self.bot.updates(offset, timeout=15):
                     offset = update["update_id"] + 1
                     self.db.tenant(GLOBAL).set_meta("offset", offset)
+                    self.last_poll = time.time()
                     try:
                         self.handle(update)
                     except Exception:  # noqa: BLE001 - one bad update must not stop the bot
                         log.exception("update failed")
+                self.last_poll = time.time()
+                # Heartbeat on disk: a probe inside the container reads this instead of
+                # starting a second poll loop, and the timestamp proves it is advancing.
+                try:
+                    marker.write_text(str(int(self.last_poll)), encoding="utf-8")
+                except OSError as exc:
+                    log.warning("heartbeat not written: %s", exc)
             except (TelegramError, OSError) as exc:
                 log.warning("poll error: %s", exc)
                 time.sleep(5)
