@@ -6,9 +6,11 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/freelancer-manager
-Environment=FL_USERNAME=aryanhz
+# install.sh rewrites this unit; this copy documents the shape for a manual setup.
+# Paths assume the app lives at /opt/freelancer-manager with a .venv inside.
+EnvironmentFile=-/opt/freelancer-manager/.env
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/usr/bin/python3 -m freelancer_manager run --interval 1800
+ExecStart=/opt/freelancer-manager/.venv/bin/python -m freelancer_manager run
 Restart=always
 RestartSec=10
 NoNewPrivileges=yes
