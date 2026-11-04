@@ -15,6 +15,26 @@ server with `git clone` + `bash deploy/install.sh`, or run it as a container.
 
 A background scout re-scans every `FL_INTERVAL` minutes and stays silent when nothing qualifies.
 
+## Management menu
+
+`/start` (or `/menu`) pins a persistent keyboard with every section:
+
+```
+🔎 اسکن            📝 پیش‌نویس‌ها
+📊 وضعیت           ⚙️ تنظیمات
+🤖 هوش مصنوعی      🔑 سشن فریلنسر
+📋 لاگ             🧹 پاک‌سازی
+```
+
+Buttons just send a command, so text and taps share one dispatcher. Sections:
+
+- **وضعیت** — seen projects, pending drafts, placed bids, last scan age and result, live AI endpoint, active budget.
+- **تنظیمات** — one button per knob (budget floor/ceiling, max competing bids, shortlist size, scan interval, delivery period, milestone, background scanning on/off). Tapping asks for a value; the next message is stored, validated, applied to the live config and persisted in `meta`. `/cancel` aborts.
+- **هوش مصنوعی** — see below.
+- **سشن فریلنسر** — `verify_session()`, because an expired cookie jar still answers HTTP 200.
+- **لاگ** — the last log lines from an in-process ring buffer, so `/logs` works without journald.
+- **پاک‌سازی** — clears the seen list behind an inline confirm, so the next scan can rediscover the current pool.
+
 ## AI settings (`/ai`)
 
 The model endpoint is **not** in the code. It lives in the `meta` table and is edited
@@ -77,10 +97,16 @@ Skills are matched against `MY_SKILLS` in `scan.py`; a project must share at lea
 ## Commands
 
 ```
+/menu            pin the management keyboard
 /scan            scan now
 /drafts          drafts waiting for approval
 /bids            my bids, straight from the API
+/status          counters, last scan, active settings
+/settings        edit budget, interval, shortlist, ...
 /ai              model endpoint settings
+/session         check the Freelancer session
+/logs            last log lines
+/cleanup         clear the seen list (asks first)
 price 40802006 250 5    change amount and period, re-offer the send button
 40802006         write a draft for that project id
 ```
@@ -92,6 +118,9 @@ freelancer_manager/
   api.py         Freelancer.com client (cookies + freelancer-auth-v2 header)
   scan.py        pure filter/rank functions — no network, easy to test
   aisettings.py  AI endpoint settings, one chat call, /ai test ping
+  runtime.py     budget/interval/shortlist/period — editable from /settings
+  menu.py        the pinned keyboard, label→command map, status/settings text
+  logbuf.py      in-process log ring behind /logs
   proposal.py    LLM drafting
   store.py       SQLite: seen, drafts, bids, meta
   bot.py         dispatcher, scanning, drafting, bidding
