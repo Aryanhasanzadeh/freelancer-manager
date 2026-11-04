@@ -1,0 +1,279 @@
+"""The Telegram bot: scanning, drafting, confirming and placing bids.
+
+Everything about Freelancer.com happens here. Nothing is sent to any other chat,
+and no bid is submitted without an explicit button press on the draft.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+import threading
+import time
+
+from .api import Client, FreelancerError
+from .config import Config
+from .proposal import DraftError, draft_proposal
+from .scan import TERMS, Filters, normalize, rank, reject_reason
+from .store import Store
+from .tg import Bot, TelegramError, esc
+
+log = logging.getLogger(__name__)
+
+ID_RE = re.compile(r"\b(40\d{6})\b")
+
+
+class App:
+    def __init__(self, cfg: Config) -> None:
+        self.cfg = cfg
+        self.bot = Bot(cfg)
+        self.api = Client(cfg)
+        self.store = Store(cfg.db_path)
+        self.filters = Filters(cfg.budget_min, cfg.budget_max, cfg.max_bids)
+
+    # ------------------------------------------------------------- scanning
+    def scan(self) -> tuple[list[dict], int]:
+        pool: dict[int, dict] = {}
+        for term in TERMS:
+            try:
+                for p in self.api.fetch_projects(term):
+                    pool[p["id"]] = p
+            except FreelancerError as exc:
+                log.warning("fetch %s failed: %s", term, exc)
+        seen = self.store.seen_ids()
+        now = time.time()
+        found = [
+            normalize(p, now)
+            for p in pool.values()
+            if p["id"] not in seen and reject_reason(p, self.filters, now) is None
+        ]
+        return rank(found), len(pool)
+
+    def format_project(self, p: dict) -> str:
+        lines = [
+            f"<b>{esc(p['title'])}</b>",
+            esc(p["url"]),
+            f"💰 ${p['budget_min_usd']:.0f}–${p['budget_max_usd']:.0f} "
+            f"({esc(p['orig_budget'])}) · {p['bids']} bid · avg ${p['bid_avg_usd']:.0f} · "
+            f"{p['days_left']:.1f} روز مانده",
+            f"🛠 {esc(', '.join(p['matched_skills']))}",
+            esc(p["description"][:500]) + ("…" if len(p["description"]) > 500 else ""),
+        ]
+        return "\n".join(lines)
+
+    def cmd_scan(self) -> None:
+        try:
+            self.api.verify_session()
+        except FreelancerError as exc:
+            self.bot.send(f"⚠️ سشن فریلنسر معتبر نیست: <code>{esc(exc)}</code>")
+            return
+        try:
+            items, pool_size = self.scan()
+        except Exception as exc:  # noqa: BLE001 - never let a scan kill the bot
+            log.exception("scan failed")
+            self.bot.send(f"⚠️ اسکن شکست خورد: <code>{esc(exc)}</code>")
+            return
+
+        if not items:
+            self.bot.send(f"این دور پروژهٔ خوبی پیدا نشد. (استخر: {pool_size})")
+            return
+
+        top = items[: self.cfg.shortlist]
+        self.bot.send(f"🔎 <b>{len(items)}</b> پروژهٔ مناسب از {pool_size} پروژه.")
+        for p in top:
+            self.store.mark_seen(p["id"], p["title"])
+            kb = [[{"text": f"✍️ پیشنهاد بده — ${p['budget_min_usd']:.0f}", "callback_data": f"draft:{p['id']}"}]]
+            self.bot.send(self.format_project(p), keyboard=kb)
+
+    # -------------------------------------------------------------- drafting
+    def make_draft(self, pid: int, chat_note: str = "") -> None:
+        try:
+            project = self.api.project(pid)
+        except (FreelancerError, KeyError, IndexError) as exc:
+            self.bot.send(f"⚠️ پروژهٔ {pid} خوانده نشد: <code>{esc(exc)}</code>")
+            return
+
+        budget = project.get("budget") or {}
+        rate = (project.get("currency") or {}).get("exchange_rate") or 1
+        low_usd = float(budget.get("minimum") or 0) * float(rate)
+        amount = round(max(low_usd, self.cfg.budget_min), 2)
+        period = self.cfg.default_period
+        skills = [j.get("name", "") for j in project.get("jobs", [])]
+
+        try:
+            text = draft_proposal(
+                project.get("title", ""),
+                project.get("description", ""),
+                budget,
+                skills,
+                amount,
+                period,
+            )
+        except (DraftError, Exception) as exc:  # noqa: BLE001
+            log.exception("draft failed")
+            self.bot.send(f"⚠️ نوشتن پیشنهاد شکست خورد: <code>{esc(exc)}</code>")
+            return
+
+        self.store.save_draft(pid, project.get("title", ""), amount, period, text)
+        kb = [
+            [{"text": f"✅ تأیید و ارسال — ${amount:.0f} / {period} روز", "callback_data": f"send:{pid}"}],
+            [{"text": "✏️ ویرایش قیمت", "callback_data": f"price:{pid}"},
+             {"text": "🗑 دور بریز", "callback_data": f"drop:{pid}"}],
+        ]
+        body = (
+            f"<b>پیش‌نویس پیشنهاد</b>\n"
+            f"{esc(project.get('title', ''))}\n"
+            f"https://www.freelancer.com/projects/{project.get('seo_url', '')}/details\n\n"
+            f"{esc(text)}\n\n"
+            f"<b>${amount:.0f}</b> · <b>{period} روز</b> · milestone {self.cfg.milestone}%"
+        )
+        if chat_note:
+            body = f"<i>{esc(chat_note)}</i>\n" + body
+        self.bot.send(body, keyboard=kb)
+
+    # ---------------------------------------------------------------- bidding
+    def send_bid(self, pid: int) -> None:
+        d = self.store.draft(pid)
+        if not d:
+            self.bot.send(f"⚠️ پیش‌نویسی برای {pid} ذخیره نشده.")
+            return
+        try:
+            res = self.api.place_bid(pid, d["amount"], d["period"], d["description"])
+        except FreelancerError as exc:
+            self.store.set_draft_status(pid, "failed")
+            self.bot.send(f"⚠️ ارسال bid رد شد: <code>{esc(exc.code or exc)}</code>\n{esc(str(exc))}")
+            return
+
+        bid = res.get("bids", [{}])[0] if isinstance(res, dict) else {}
+        bid_id = bid.get("id")
+        self.store.record_bid(bid_id, pid, d["amount"], d["period"])
+        self.store.set_draft_status(pid, "sent", bid_id)
+        self.bot.send(
+            f"✅ bid ارسال شد.\n"
+            f"#{esc(bid_id)} · ${d['amount']:.0f} · {d['period']} روز\n"
+            f"https://www.freelancer.com/projects/{pid}/"
+        )
+
+    # ------------------------------------------------------------ dispatch
+    def handle(self, update: dict) -> None:
+        if "callback_query" in update:
+            q = update["callback_query"]
+            data = q.get("data", "")
+            action, _, arg = data.partition(":")
+            self.bot.answer_callback(q["id"])
+            if action == "draft":
+                self.make_draft(int(arg))
+            elif action == "send":
+                self.send_bid(int(arg))
+            elif action == "drop":
+                self.store.set_draft_status(int(arg), "discarded")
+                self.bot.send(f"پیش‌نویس {arg} کنار گذاشته شد.")
+            elif action == "price":
+                self.bot.send(f"قیمت جدید را بفرست: <code>price {arg} 250 5</code>")
+            return
+
+        msg = update.get("message") or {}
+        text = (msg.get("text") or "").strip()
+        if not text:
+            return
+        # Bind the chat on first contact instead of requiring a pre-known id.
+        chat_id = str((msg.get("chat") or {}).get("id") or "")
+        if chat_id and chat_id != self.cfg.chat_id:
+            self.cfg.save_chat_id(chat_id)
+            log.info("bound to chat %s", chat_id)
+        low = text.lower()
+
+        if low.startswith("/start"):
+            self.bot.send(
+                "ربات پروژه‌یاب آماده است.\n"
+                "/scan — اسکن projekt‌های جدید\n"
+                "/drafts — پیش‌نویس‌های منتظر تأیید\n"
+                "/bids — bid‌های ثبت‌شده\n"
+                "یا فقط آیدی پروژه را بنویس تا پیشنهاد بنویسم."
+            )
+        elif low.startswith("/scan"):
+            self.cmd_scan()
+        elif low.startswith("/drafts"):
+            rows = self.store.pending_drafts()
+            if not rows:
+                self.bot.send("پیش‌نویس منتظر تأییدی نیست.")
+                return
+            for r in rows:
+                kb = [[{"text": f"✅ تأیید و ارسال — ${r['amount']:.0f}", "callback_data": f"send:{r['project_id']}"}]]
+                self.bot.send(
+                    f"<b>{esc(r['title'])}</b>\n${r['amount']:.0f} · {r['period']} روز\n"
+                    f"{esc(r['description'][:600])}",
+                    keyboard=kb,
+                )
+        elif low.startswith("/bids"):
+            bids, _ = self.api.my_bids()
+            if not bids:
+                self.bot.send("bid ثبت‌شده‌ای نیست.")
+                return
+            body = "\n".join(
+                f"#{b['id']} · ${b['amount']:.0f} · {b['period']} روز · پ‍روژه {b['project_id']}"
+                for b in bids[:10]
+            )
+            self.bot.send(f"<b>bid‌های من</b>\n{body}")
+        elif low.startswith("price "):
+            parts = text.split()
+            if len(parts) in (3, 4) and parts[1].isdigit() and parts[2].replace(".", "", 1).isdigit():
+                pid = int(parts[1])
+                amount = float(parts[2])
+                period = int(parts[3]) if len(parts) == 4 and parts[3].isdigit() else self.cfg.default_period
+                d = self.store.draft(pid)
+                if d:
+                    self.store.save_draft(pid, d["title"], amount, period, d["description"])
+                    kb = [[{"text": f"✅ تأیید و ارسال — ${amount:.0f} / {period} روز",
+                            "callback_data": f"send:{pid}"}]]
+                    self.bot.send(f"قیمت به <b>${amount:.0f}</b> و <b>{period} روز</b> تغییر کرد.",
+                                  keyboard=kb)
+                else:
+                    self.bot.send("پیش‌نویسی با این آیدی نیست.")
+            else:
+                self.bot.send("شکل درست: <code>price 40812345 250</code> یا <code>price 40812345 250 5</code>")
+        elif ID_RE.search(text):
+            self.make_draft(int(ID_RE.search(text).group(1)))
+
+    # ----------------------------------------------------------------- loop
+    def run(self) -> None:
+        me = self.bot.call("getMe")
+        log.info("bot @%s up", me.get("username"))
+        offset = int(self.store.get_meta("offset", 0) or 0)
+        while True:
+            try:
+                for update in self.bot.updates(offset):
+                    offset = update["update_id"] + 1
+                    self.store.set_meta("offset", offset)
+                    try:
+                        self.handle(update)
+                    except Exception:  # noqa: BLE001 - one bad update must not stop the bot
+                        log.exception("update failed")
+            except (TelegramError, OSError) as exc:
+                log.warning("poll error: %s", exc)
+                time.sleep(5)
+
+
+def start_scout_thread(app: App, interval_min: int) -> None:
+    """Periodic background scan. Silent when nothing is eligible, like the cron job was."""
+
+    def loop() -> None:
+        while True:
+            try:
+                items, _ = app.scan()
+                if items:
+                    top = items[: app.cfg.shortlist]
+                    app.bot.send(f"🔎 <b>{len(items)}</b> پروژهٔ جدید پیدا شد.")
+                    for p in top:
+                        app.store.mark_seen(p["id"], p["title"])
+                        kb = [[{"text": f"✍️ پیشنهاد بده — ${p['budget_min_usd']:.0f}",
+                                "callback_data": f"draft:{p['id']}"}]]
+                        app.bot.send(app.format_project(p), keyboard=kb)
+                else:
+                    log.info("scout: nothing eligible")
+            except Exception:  # noqa: BLE001
+                log.exception("scout cycle failed")
+            time.sleep(interval_min * 60)
+
+    t = threading.Thread(target=loop, name="scout", daemon=True)
+    t.start()
