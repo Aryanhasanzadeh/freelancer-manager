@@ -26,7 +26,10 @@ def install(level: int = logging.INFO) -> None:
         return
     h = RingHandler()
     h.setLevel(level)
-    h.setFormatter(logging.Formatter("%H:%M:%S %(levelname)s %(name)s: %(message)s"))
+    # logging uses %-style, not strftime: "%H" would raise on every record and the
+    # exception would be swallowed, leaving /logs permanently empty.
+    h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s",
+                                     datefmt="%H:%M:%S"))
     root.addHandler(h)
 
 

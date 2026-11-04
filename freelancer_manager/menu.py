@@ -15,10 +15,11 @@ from .runtime import SPEC
 
 ROW_MAIN = ["🔎 اسکن", "📝 پیش‌نویس‌ها"]
 ROW_MAIN2 = ["📊 وضعیت", "⚙️ تنظیمات"]
-ROW_MAIN3 = ["🤖 هوش مصنوعی", "🔑 سشن فریلنسر"]
-ROW_MAIN4 = ["📋 لاگ", "🧹 پاک‌سازی"]
+ROW_MAIN3 = ["🤖 هوش مصنوعی", "🔑 اکانت فریلنسر"]
+ROW_MAIN4 = ["📋 لاگ", "👥 کاربران"]
+ROW_MAIN5 = ["🧹 پاک‌سازی", "🔄 اسکن خودکار", "🧑‍💻 معرفی من"]
 
-MENU_ROWS = [ROW_MAIN, ROW_MAIN2, ROW_MAIN3, ROW_MAIN4]
+MENU_ROWS = [ROW_MAIN, ROW_MAIN2, ROW_MAIN3, ROW_MAIN4, ROW_MAIN5]
 
 # Button label -> command the dispatcher already understands.
 LABEL_TO_CMD = {
@@ -27,7 +28,10 @@ LABEL_TO_CMD = {
     "📊 وضعیت": "/status",
     "⚙️ تنظیمات": "/settings",
     "🤖 هوش مصنوعی": "/ai",
-    "🔑 سشن فریلنسر": "/session",
+    "🔑 اکانت فریلنسر": "/account",
+    "👥 کاربران": "/users",
+    "🧑‍💻 معرفی من": "/profile",
+    "🔄 اسکن خودکار": "/autoscan",
     "📋 لاگ": "/logs",
     "🧹 پاک‌سازی": "/cleanup",
 }
@@ -49,8 +53,9 @@ def settings_keyboard() -> list[list[dict]]:
     return rows
 
 
-def status_text(app) -> str:
-    s = app.store
+def status_text(t) -> str:
+    """One tenant's numbers only — never the process-wide totals."""
+    s = t.store
     drafts = s.pending_drafts()
     lines = [
         "📊 <b>وضعیت ربات</b>",
@@ -58,14 +63,14 @@ def status_text(app) -> str:
         f"پروژه‌های دیده‌شده: <b>{len(s.seen_ids())}</b>",
         f"پیش‌نویس منتظر تأیید: <b>{len(drafts)}</b>",
         f"bid ثبت‌شده: <b>{s.bid_count()}</b>",
-        f"اسکن خودکار: <b>{'روشن' if app.rt['scout'] else 'خاموش'}</b>"
-        f" · هر {app.rt['interval']} دقیقه",
-        f"فاصلهٔ آخرین اسکن: {_ago(app.store.get_meta('last_scan', 0))}",
-        f"آخرین اسکن: <b>{app.store.get_meta('last_scan_found', '—')}</b> پروژهٔ واجد",
+        f"اسکن خودکار: <b>{'روشن' if t.rt['scout'] else 'خاموش'}</b>"
+        f" · هر {t.rt['interval']} دقیقه",
+        f"فاصلهٔ آخرین اسکن: {_ago(s.get_meta('last_scan', 0))}",
+        f"آخرین اسکن: <b>{s.get_meta('last_scan_found', '—')}</b> پروژهٔ واجد",
         "",
-        f"AI: <code>{app.ai.model}</code> @ <code>{app.ai.base_url}</code>",
-        f"بودجه: ${app.rt['budget_min']:g}–${app.rt['budget_max']:g}"
-        f" · حداکثر {app.rt['max_bids']} پیشنهاد رقیب",
+        f"AI: <code>{t.ai.model}</code> @ <code>{t.ai.base_url}</code>",
+        f"بودجه: ${t.rt['budget_min']:g}–${t.rt['budget_max']:g}"
+        f" · حداکثر {t.rt['max_bids']} پیشنهاد رقیب",
     ]
     return "\n".join(lines)
 

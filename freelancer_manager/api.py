@@ -24,7 +24,8 @@ class FreelancerError(RuntimeError):
 
 
 class Client:
-    def __init__(self, cfg: Config) -> None:
+    def __init__(self, cfg: Config, cookies: dict[str, str] | None = None,
+                 user_id: str | None = None) -> None:
         self.cfg = cfg
         self.s = requests.Session()
         self.s.headers.update(
@@ -34,10 +35,12 @@ class Client:
                 "Referer": "https://www.freelancer.com/",
             }
         )
-        cookies = cfg.cookies()
+        # Cookies come from the caller's own tenant, never from a global file, so one
+        # user's session can never be reused for another user's requests.
+        cookies = cfg.cookies() if cookies is None else cookies
         for k, v in cookies.items():
             self.s.cookies.set(k, v, domain=".freelancer.com")
-        self.uid = cookies.get("GETAFREE_USER_ID", cfg.user_id)
+        self.uid = cookies.get("GETAFREE_USER_ID", user_id or cfg.user_id)
         raw = urllib.parse.unquote(cookies.get("GETAFREE_AUTH_HASH_V2", ""))
         if raw:
             # POST endpoints reject an unauthenticated session even with valid cookies.

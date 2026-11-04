@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from .aisettings import AISettings, chat
 
-SYSTEM = """You write Freelancer.com bids for Aryan Hasanzadeh (username aryanhz), \
-a senior developer with 10+ years of experience in PHP/Laravel, Python, MySQL, \
-JavaScript and API integrations. He builds scrapers, automation pipelines, \
-dashboards and Telegram bots.
+SYSTEM = """You write one freelancer's bid on Freelancer.com. You are given that \
+freelancer's own profile below; write in the first person as that person and use \
+only the skills and experience the profile claims. If the profile is empty, keep it \
+generic and never invent a name, a client, a certification or years of experience.
 
 Rules for every bid:
 - Plain English, no markdown, no emoji, no headings.
@@ -26,11 +26,13 @@ class DraftError(RuntimeError):
 
 
 def draft_proposal(title: str, description: str, budget: dict, skills: list[str],
-                   amount: float, period: int, settings: AISettings | None = None) -> str:
+                   amount: float, period: int, settings: AISettings | None = None,
+                   profile: str = "") -> str:
     if settings is None:
         settings = AISettings.load()
 
     prompt = (
+        f"My profile / background:\n{profile.strip()[:1200] or 'not provided'}\n\n"
         f"Project title: {title}\n"
         f"Budget: {budget.get('minimum')}-{budget.get('maximum')} {budget.get('currency', 'USD')}\n"
         f"Required skills: {', '.join(skills) or 'none listed'}\n"

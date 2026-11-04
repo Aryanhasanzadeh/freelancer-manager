@@ -78,6 +78,10 @@ class Config:
         path.chmod(0o600)
 
     def cookies(self) -> dict[str, str]:
+        # A missing file is the normal logged-out state, not a crash: the bot has to
+        # start so /account can tell the operator the cookie is gone.
+        if not self.cookies_path.exists():
+            return {}
         out: dict[str, str] = {}
         for line in self.cookies_path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
