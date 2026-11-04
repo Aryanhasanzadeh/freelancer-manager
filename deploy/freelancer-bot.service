@@ -8,7 +8,7 @@ Type=simple
 WorkingDirectory=/opt/freelancer-manager
 Environment=FL_USERNAME=aryanhz
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/usr/bin/python3 -m freelancer_manager run --interval 180
+ExecStart=/usr/bin/python3 -m freelancer_manager run --interval 1800
 Restart=always
 RestartSec=10
 NoNewPrivileges=yes
